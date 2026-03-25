@@ -1,0 +1,516 @@
+He aquí el código completo de AEGIS v4.0.0, listo para subir a GitHub. Es un solo archivo Python que integra todas las funcionalidades: configuración, anonimización, honeypot, detección de implantes, RAG, conocimiento persistente, generador de wiki, interfaz gráfica y comandos de seguridad. Se han aplicado todas las correcciones y mejoras discutidas.
+
+```python
+#!/usr/bin/env python3
+"""
+AEGIS v4.0.0 - Experimental Build
+Advanced security toolkit with honeypot, threat intelligence, implant detection,
+RAG-based AI assistant, and GUI.
+
+Author: AEGIS Team
+License: MIT (or specify your license)
+
+Requirements:
+- Python 3.8+
+- Optional: requests, paramiko, chromadb, sentence-transformers
+- Linux (or macOS with limitations) with tkinter, sudo, nftables, etc.
+"""
+
+import os
+import sys
+import socket
+import threading
+import time
+import json
+import hashlib
+import logging
+import subprocess
+import re
+import random
+import tempfile
+import signal
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple, Any
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
+
+# ============================================================================
+# Platform check
+# ============================================================================
+if sys.platform not in ("linux", "darwin"):
+    sys.stderr.write("AEGIS only supports Linux and macOS.\n")
+    sys.exit(1)
+
+# ============================================================================
+# Dependencies (optional)
+# ============================================================================
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    logging.warning("Requests library missing. Install with: pip install requests")
+
+try:
+    import paramiko
+    PARAMIKO_AVAILABLE = True
+except ImportError:
+    PARAMIKO_AVAILABLE = False
+    logging.warning("Paramiko not installed. Honeypot disabled.")
+
+try:
+    import chromadb
+    from sentence_transformers import SentenceTransformer
+    VECTOR_DB_AVAILABLE = True
+except ImportError:
+    VECTOR_DB_AVAILABLE = False
+    logging.warning("Vector DB not available. Install chromadb and sentence-transformers.")
+
+# ============================================================================
+# Configuration & Constants
+# ============================================================================
+AEGIS_HOME = Path.home() / ".aegis"
+AEGIS_HOME.mkdir(parents=True, exist_ok=True)
+
+CONFIG_FILE = AEGIS_HOME / "config.json"
+ANON_CONFIG = AEGIS_HOME / "anon_config.json"
+
+VOLATILE_ROOT = Path("/dev/shm/.aegis")
+VOLATILE_ROOT.mkdir(mode=0o700, exist_ok=True)
+HONEY_VOLATILE = VOLATILE_ROOT / "honeypot"
+HONEY_VOLATILE.mkdir(mode=0o700, exist_ok=True)
+RAG_VOLATILE = VOLATILE_ROOT / "rag"
+RAG_VOLATILE.mkdir(mode=0o700, exist_ok=True)
+
+WIDGET_SOCKET = VOLATILE_ROOT / "widget.sock"
+CMD_SOCKET = VOLATILE_ROOT / "control.sock"
+INGEST_SOCKET = VOLATILE_ROOT / "ingestor.sock"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(AEGIS_HOME / "aegis.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("AEGIS")
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
+class Config:
+    """Manages persistent configuration."""
+    DEFAULT = {
+        "ollama_model": "phi3:mini",
+        "ollama_timeout": 45,
+        "theme": "dark",
+        "anonymize_enabled": True,
+        "honeypot_enabled": False,
+        "honeypot_port": 2222,
+        "tor_enabled": False,
+        "knowledge_db_path": str(AEGIS_HOME / "knowledge"),
+        "wiki_output_path": str(AEGIS_HOME / "wiki")
+    }
+
+    def __init__(self):
+        self.data = self.load()
+
+    def load(self) -> Dict:
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except:
+                pass
+        return self.DEFAULT.copy()
+
+    def save(self):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.data, f, indent=2)
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value):
+        self.data[key] = value
+        self.save()
+
+config = Config()
+
+# ============================================================================
+# Security & Anonymization
+# ============================================================================
+class SecureAuth:
+    """Handles secure password input and memory wiping."""
+    @staticmethod
+    def get_password() -> Optional[bytearray]:
+        raw = simpledialog.askstring("SUDO", "Authorization required:", show="*")
+        return bytearray(raw.encode('utf-8')) if raw else None
+
+    @staticmethod
+    def wipe(ba: bytearray):
+        if ba:
+            for i in range(len(ba)):
+                ba[i] = 0
+            del ba
+
+class AnonymizerService:
+    """Anonymizes PII in text based on rules."""
+    def __init__(self):
+        self.config = self._load_config()
+        self._patterns = []
+        self.compile_rules()
+
+    def _load_config(self) -> Dict:
+        if ANON_CONFIG.exists():
+            return json.loads(ANON_CONFIG.read_text())
+        default = {
+            "ipv4": {"enabled": True, "repl": "[IP4]"},
+            "ipv6": {"enabled": True, "repl": "[IP6]"},
+            "users": {"enabled": True, "repl": "[USR]"},
+            "emails": {"enabled": True, "repl": "[MAIL]"},
+            "macs": {"enabled": True, "repl": "[MAC]"}
+        }
+        ANON_CONFIG.write_text(json.dumps(default, indent=2))
+        return default
+
+    def compile_rules(self):
+        self._patterns = []
+        if self.config["ipv4"]["enabled"]:
+            self._patterns.append((re.compile(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'), self.config["ipv4"]["repl"]))
+        if self.config["ipv6"]["enabled"]:
+            self._patterns.append((re.compile(r'(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:)'), self.config["ipv6"]["repl"]))
+        if self.config["users"]["enabled"]:
+            repl = re.escape(self.config["users"]["repl"])
+            self._patterns.append((re.compile(r'/(home|Users)/([a-zA-Z0-9._-]+)'), lambda m: f"/{m.group(1)}/{repl}"))
+        if self.config["emails"]["enabled"]:
+            self._patterns.append((re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'), self.config["emails"]["repl"]))
+        if self.config["macs"]["enabled"]:
+            self._patterns.append((re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}(?:[0-9A-Fa-f]{2})\b'), self.config["macs"]["repl"]))
+
+    def scrub(self, text: str) -> str:
+        for pattern, replacement in self._patterns:
+            text = pattern.sub(replacement, text)
+        return text
+
+# ============================================================================
+# Notification Service
+# ============================================================================
+class NotificationService:
+    """Sends desktop notifications."""
+    @staticmethod
+    def notify(title: str, message: str):
+        try:
+            if subprocess.call(["which", "notify-send"], stdout=subprocess.DEVNULL) == 0:
+                subprocess.run(["notify-send", f"AEGIS: {title}", message])
+            elif subprocess.call(["which", "kdialog"], stdout=subprocess.DEVNULL) == 0:
+                subprocess.run(["kdialog", "--title", f"AEGIS: {title}", "--passivepopup", message, "5"])
+        except Exception as e:
+            logger.warning(f"Notification failed: {e}")
+
+# ============================================================================
+# System Service (Privileged Operations)
+# ============================================================================
+class SystemService:
+    """Executes privileged system commands."""
+    @staticmethod
+    def check_dep(cmd: str) -> bool:
+        try:
+            return subprocess.run(["which", cmd], capture_output=True).returncode == 0
+        except:
+            return False
+
+    @staticmethod
+    def run_elevated(script: str) -> bool:
+        if not SystemService.check_dep("sudo"):
+            logger.error("sudo not available")
+            return False
+        password = SecureAuth.get_password()
+        if not password:
+            return False
+        try:
+            proc = subprocess.Popen(
+                ["sudo", "-S", "sh", "-c", script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False
+            )
+            _, stderr = proc.communicate(input=password + b'\n', timeout=30)
+            if proc.returncode != 0:
+                # Do not log stderr content as it might contain password fragments
+                logger.error(f"sudo failed (return code {proc.returncode})")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Elevated run error: {e}")
+            return False
+        finally:
+            SecureAuth.wipe(password)
+
+# ============================================================================
+# Ollama Service
+# ============================================================================
+class OllamaService:
+    """Interface to Ollama LLM."""
+    def __init__(self):
+        self.model = config.get("ollama_model")
+        self.timeout = config.get("ollama_timeout")
+        self.base_url = "http://127.0.0.1:11434/api"
+        if not REQUESTS_AVAILABLE:
+            logger.error("Requests library missing. Ollama service disabled.")
+
+    def list_models(self) -> List[str]:
+        if not REQUESTS_AVAILABLE:
+            return ["phi3:mini", "llama3", "mistral"]
+        try:
+            resp = requests.get(f"{self.base_url}/tags", timeout=3)
+            if resp.status_code == 200:
+                return [m['name'] for m in resp.json().get('models', [])]
+        except:
+            pass
+        return ["phi3:mini", "llama3", "mistral"]
+
+    def generate(self, prompt: str, context: str = "", retries: int = 2) -> str:
+        if not REQUESTS_AVAILABLE:
+            return "Error: requests library missing."
+        full_prompt = f"{context}\n{prompt}" if context else prompt
+        payload = {
+            "model": self.model,
+            "prompt": full_prompt,
+            "stream": False,
+            "options": {"temperature": 0.7}
+        }
+        for attempt in range(retries + 1):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/generate",
+                    json=payload,
+                    timeout=self.timeout
+                )
+                resp.raise_for_status()
+                return resp.json().get("response", "")
+            except Exception as e:
+                if attempt == retries:
+                    logger.error(f"Ollama error: {e}")
+                    return f"Error: {e}"
+                time.sleep(2)
+        return ""
+
+# ============================================================================
+# Mimir RAG (Volatile Session Memory)
+# ============================================================================
+class MimirRAG:
+    """Volatile memory with simple keyword indexing."""
+    def __init__(self):
+        self.path = RAG_VOLATILE
+        self.path.mkdir(exist_ok=True)
+        self.session_salt = os.urandom(16).hex()
+        self._index = {}  # keyword -> list of file names
+        self._rebuild_index()
+
+    def _rebuild_index(self):
+        """Rebuild index from existing files."""
+        self._index.clear()
+        for f in self.path.glob("*.tmp"):
+            try:
+                content = f.read_text(errors='ignore')
+                for word in set(w.lower() for w in content.split() if len(w) > 3):
+                    self._index.setdefault(word, []).append(f.name)
+            except:
+                continue
+
+    def commit(self, q: str, a: str, meta: Optional[Dict] = None):
+        content = f"Q: {q}\nA: {a}\n"
+        if meta:
+            content += f"META: {json.dumps(meta)}\n"
+        h = hashlib.sha256(f"{content}{self.session_salt}".encode()).hexdigest()[:12]
+        fname = f"{h}.tmp"
+        (self.path / fname).write_text(content)
+        # Update index
+        for word in set(w.lower() for w in content.split() if len(w) > 3):
+            self._index.setdefault(word, []).append(fname)
+
+    def fetch(self, query: str) -> str:
+        keywords = [w.lower() for w in query.split() if len(w) > 3]
+        candidates = set()
+        for kw in keywords:
+            for fname in self._index.get(kw, []):
+                candidates.add(fname)
+        results = []
+        for fname in candidates:
+            try:
+                content = (self.path / fname).read_text(errors='ignore')
+                results.append(content)
+            except:
+                continue
+        return "\n---\n".join(results[-2:])
+
+    def purge(self):
+        for f in self.path.glob("*.tmp"):
+            try:
+                size = f.stat().st_size
+                with open(f, "wb") as fw:
+                    fw.write(os.urandom(size))
+                f.unlink()
+            except:
+                pass
+        self._index.clear()
+
+# ============================================================================
+# Aegis Knowledge (Persistent Vector DB)
+# ============================================================================
+class AegisKnowledge:
+    """Persistent vector database for documents."""
+    def __init__(self):
+        self.db_path = Path(config.get("knowledge_db_path"))
+        self.db_path.mkdir(parents=True, exist_ok=True)
+        self._chroma = None
+        self._model = None
+        self._collection = None
+        self._init_optional()
+
+    def _init_optional(self):
+        if not VECTOR_DB_AVAILABLE:
+            logger.warning("Vector DB not available.")
+            return
+        try:
+            self._chroma = chromadb.PersistentClient(path=str(self.db_path))
+            self._collection = self._chroma.get_or_create_collection(
+                name="universal_knowledge",
+                metadata={"hnsw:space": "cosine"}
+            )
+            # Load model lazily
+        except Exception as e:
+            logger.warning(f"Failed to initialize vector DB: {e}")
+            self._chroma = None
+
+    def _get_model(self):
+        if self._model is None and VECTOR_DB_AVAILABLE:
+            try:
+                self._model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+            except Exception as e:
+                logger.error(f"Failed to load SentenceTransformer: {e}")
+                self._model = None
+        return self._model
+
+    def add_document(self, text: str, source: str, category: str, topic: str):
+        if self._chroma is None or not self._get_model():
+            logger.warning("Vector DB disabled, document not stored.")
+            return
+        doc_id = hashlib.sha256(text.encode()).hexdigest()
+        embedding = self._model.encode(text).tolist()
+        self._collection.upsert(
+            ids=[doc_id],
+            embeddings=[embedding],
+            documents=[text],
+            metadatas=[{
+                "source": source,
+                "category": category,
+                "topic": topic,
+                "timestamp": str(datetime.now())
+            }]
+        )
+
+    def query(self, text: str, n_results: int = 3, category: Optional[str] = None) -> Tuple[List[str], List[Dict]]:
+        if self._chroma is None or not self._get_model():
+            return [], []
+        query_emb = self._model.encode(text).tolist()
+        where_filter = {"category": category} if category else None
+        results = self._collection.query(
+            query_embeddings=[query_emb],
+            n_results=n_results,
+            where=where_filter
+        )
+        return results['documents'][0], results['metadatas'][0]
+
+# ============================================================================
+# Wiki Generator
+# ============================================================================
+class WikiEngine:
+    """Generates wiki pages from knowledge base."""
+    def __init__(self, kg: AegisKnowledge):
+        self.kg = kg
+        self.out_path = Path(config.get("wiki_output_path"))
+        self.out_path.mkdir(parents=True, exist_ok=True)
+
+    def rebuild_category(self, category: str):
+        docs, metas = self.kg.query(f"All documentation for {category}", n_results=50, category=category)
+        md = f"# AEGIS WIKI: {category.upper()}\n\nGenerated: {datetime.now()}\n\n"
+        for d, m in zip(docs, metas):
+            md += f"### Source: {m['source']}\n> {d}\n\n---\n"
+        (self.out_path / f"{category}.md").write_text(md)
+
+# ============================================================================
+# Honeypot & Threat Intelligence (only if paramiko available)
+# ============================================================================
+if PARAMIKO_AVAILABLE:
+    class AttackerProfiler:
+        """Profiles attacker tools and creates fingerprints."""
+        SIGNATURES = {
+            "sqlmap": [r"sqlmap", r"ORDER BY", r"UNION SELECT"],
+            "nmap": [r"Nmap", r"Nmap Scripting Engine"],
+            "metasploit": [r"meterpreter", r"rev_tcp", r"payload"],
+            "hydra": [r"hydra", r"login:", r"password:"],
+            "brute_force": [r"admin", r"root", r"123456", r"password"]
+        }
+
+        @staticmethod
+        def identify_tool(commands: List[str], attempts: List[Dict]) -> List[str]:
+            detected = set()
+            blob = (" ".join(commands) + " " + " ".join([str(a) for a in attempts])).lower()
+            for tool, patterns in AttackerProfiler.SIGNATURES.items():
+                if any(re.search(p, blob) for p in patterns):
+                    detected.add(tool)
+            return list(detected)
+
+        @staticmethod
+        def get_actor_hash(ip: str, tools: List[str]) -> str:
+            seed = f"{ip}{''.join(sorted(tools))}"
+            return hashlib.sha256(seed.encode()).hexdigest()[:12]
+
+        @staticmethod
+        def client_fingerprint(transport) -> Dict:
+            try:
+                return {
+                    "client_version": transport.remote_version,
+                    "ciphers": transport.get_security_options().ciphers,
+                    "kex_algorithms": transport.get_security_options().kex
+                }
+            except:
+                return {}
+
+    class AegisSSHInterface(paramiko.ServerInterface):
+        """Custom SSH server interface for honeypot."""
+        def __init__(self, client_ip, transport):
+            self.client_ip = client_ip
+            self.transport = transport
+            self.attempts = []
+            self.commands = []
+            self.client_info = AttackerProfiler.client_fingerprint(transport)
+
+        def check_auth_password(self, username, password):
+            self.attempts.append({"username": username, "password": password, "timestamp": str(datetime.now())})
+            return paramiko.AUTH_SUCCESSFUL
+
+        def check_channel_exec_request(self, channel, command):
+            self.commands.append(command)
+            channel.send(f"bash: {command.split()[0]}: command not found\r\n".encode())
+            channel.send_exit_status(127)
+            return True
+
+    class GhostOrchestrator:
+        """Single honeypot SSH sensor."""
+        def __init__(self, port=22, on_attacker_callback=None):
+            self.port = port
+            # Use a persistent key if available
+            key_path = AEGIS_HOME / "honeypot_key"
+            if key_path.exists():
+                self.host_key = paramiko.RSAKey.from_private_key_file(str(key_path))
+            else:
+                self.host_key = paramiko.RSAKey.generate(2048)
+                self.host_key.write_private_key_file(str(key_path))
+            self.running = True
+            s
